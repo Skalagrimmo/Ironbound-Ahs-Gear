@@ -1,0 +1,6 @@
+{
+  "name": "Ironbound RPG",
+  "description": "Isometric gothic-industrial tactical action RPG powered by LittleKt, OpenGL ES 3.0 SVDAG rendering optimized for Exynos 7870, Remember Me custom combo lab, Grim Dawn loot & inventory, talent trees, and offline Room persistence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
