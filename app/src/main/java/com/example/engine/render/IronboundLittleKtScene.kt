@@ -38,6 +38,8 @@ class IronboundLittleKtScene(
     private val viewModel: GameViewModel
 ) : ContextListener(context) {
 
+    private val gameContext: Context = context
+    private var lastViewportDiagnostic: String? = null
     private var batch: SpriteBatch? = null
     private var camera: OrthographicCamera? = null
     private var atlasTexture: Texture? = null
@@ -53,13 +55,6 @@ class IronboundLittleKtScene(
     private var currentFps = 60
     private var hudSyncTimer = 0f
 
-    // Orthonormal basis matching SvdagGlRenderer.SVDAG_FRAGMENT_SHADER
-    private val rx = 0.70710677f
-    private val rz = -0.70710677f
-    private val ux = -0.4682929f
-    private val uy = 0.7492686f
-    private val uz = -0.4682929f
-    private val zoom = 11.5f
 
     override suspend fun Context.start() {
         com.example.viewmodel.LoadedGameAssetsHolder.scene = this@IronboundLittleKtScene
@@ -139,23 +134,20 @@ class IronboundLittleKtScene(
             activeCam.update()
             activeBatch.begin(activeCam.viewProjection)
 
-            val scalePx = (h * 0.5f) / zoom
+            val scalePx = IsometricProjection.pixelsPerWorldUnit(h.toFloat())
             val camX = sim.heroX
             val camY = sim.heroY
 
-            fun worldToScreenX(wx: Float, wy: Float, wz: Float): Float {
-                val dx = wx - camX
-                val dy = wy - 1.8f
-                val dz = wz - camY
-                return w * 0.5f + (dx * rx + dz * rz) * scalePx
-            }
+            // Scalar helpers avoid per-entity projection object allocations in the render loop.
+            fun worldToScreenX(wx: Float, wy: Float, wz: Float): Float =
+                IsometricProjection.worldToLittleKtX(
+                    wx, wz, camX, camY, w.toFloat(), h.toFloat()
+                )
 
-            fun worldToScreenY(wx: Float, wy: Float, wz: Float): Float {
-                val dx = wx - camX
-                val dy = wy - 1.8f
-                val dz = wz - camY
-                return h * 0.5f + (dx * ux + dy * uy + dz * uz) * scalePx
-            }
+            fun worldToScreenY(wx: Float, wy: Float, wz: Float): Float =
+                IsometricProjection.worldToLittleKtY(
+                    wx, wy, wz, camX, camY, h.toFloat()
+                )
 
             sim.moveTargetX?.let { mtx ->
                 sim.moveTargetY?.let { mty ->
@@ -341,28 +333,49 @@ class IronboundLittleKtScene(
 
     // REPAIR_HOOK: Ізометричні перетворення екран <-> світ (синхронізовано з базисом у SvdagGlRenderer)
     fun screenToWorld(screenX: Float, screenY: Float, viewW: Float, viewH: Float): Pair<Float, Float> {
+        logProjectionViewport(viewW, viewH)
         val sim = viewModel.simulation
-        val scalePx = (viewH * 0.5f) / zoom
-        val px = (screenX - viewW * 0.5f) / scalePx
-        val glY = viewH - screenY
-        val py = (glY - viewH * 0.5f) / scalePx
-        val pyGround = py - 0.2f * uy
-        val dxMinusDz = px / rx
-        val dxPlusDz = pyGround / ux
-        val dx = (dxPlusDz + dxMinusDz) * 0.5f
-        val dz = (dxPlusDz - dxMinusDz) * 0.5f
-        return (sim.heroX + dx) to (sim.heroY + dz)
+        val world = IsometricProjection.composeToWorld(
+            screenX, screenY, viewW, viewH, sim.heroX, sim.heroY
+        )
+        return world.x to world.z
     }
 
     fun worldToComposeScreen(wx: Float, wy: Float, wz: Float, viewW: Float, viewH: Float): Pair<Float, Float> {
+        logProjectionViewport(viewW, viewH)
         val sim = viewModel.simulation
-        val scalePx = (viewH * 0.5f) / zoom
-        val dx = wx - sim.heroX
-        val dy = wy - 1.8f
-        val dz = wz - sim.heroY
-        val sx = viewW * 0.5f + (dx * rx + dz * rz) * scalePx
-        val glY = viewH * 0.5f + (dx * ux + dy * uy + dz * uz) * scalePx
-        return sx to (viewH - glY)
+        val screen = IsometricProjection.worldToCompose(
+            wx, wy, wz, sim.heroX, sim.heroY, viewW, viewH
+        )
+        return screen.x to screen.y
+    }
+
+    /**
+     * Compose and LittleKt must describe the same full-surface pixel viewport.
+     * Report a mismatch once per distinct size so device insets/scaling issues
+     * can be diagnosed without flooding Logcat from the render/HUD loop.
+     */
+    private fun logProjectionViewport(viewW: Float, viewH: Float) {
+        val composeW = viewW.toInt().coerceAtLeast(1)
+        val composeH = viewH.toInt().coerceAtLeast(1)
+        val littleKtW = gameContext.graphics.width.coerceAtLeast(1)
+        val littleKtH = gameContext.graphics.height.coerceAtLeast(1)
+        val mismatch = kotlin.math.abs(composeW - littleKtW) > 1 ||
+            kotlin.math.abs(composeH - littleKtH) > 1
+
+        if (mismatch) {
+            val signature = "Compose=${composeW}x${composeH}, LittleKt=${littleKtW}x${littleKtH}"
+            if (signature != lastViewportDiagnostic) {
+                android.util.Log.w("IronboundProjection", "Viewport size mismatch (pixels): $signature")
+                lastViewportDiagnostic = signature
+            }
+        } else if (lastViewportDiagnostic != null) {
+            android.util.Log.i(
+                "IronboundProjection",
+                "Compose and LittleKt viewport sizes match: ${composeW}x${composeH}px"
+            )
+            lastViewportDiagnostic = null
+        }
     }
 
     private fun drawAtlasRegion(

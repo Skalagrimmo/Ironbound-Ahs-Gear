@@ -427,7 +427,8 @@ class SvdagGlRenderer {
                 // Strictly orthonormal isometric camera centered on hero
                 vec3 right = normalize(vec3(1.0, 0.0, -1.0));
                 vec3 rayDir = normalize(vec3(-1.0, -1.25, -1.0));
-                vec3 up = normalize(cross(right, -rayDir));
+                // Camera up follows the right-handed basis: cross(cameraBack, right).
+                vec3 up = normalize(cross(-rayDir, right));
 
                 vec3 target = vec3(uCamCenter.x, 1.8, uCamCenter.y);
                 float zoom = 11.5;
