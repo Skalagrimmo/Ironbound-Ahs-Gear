@@ -1,6 +1,7 @@
 package com.example.viewmodel
 
 import android.app.Application
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.db.AppDatabase
@@ -8,16 +9,20 @@ import com.example.data.db.AppSettingsEntity
 import com.example.data.db.HeroProfileEntity
 import com.example.data.db.ZoneProgressEntity
 import com.example.data.repo.GameRepository
-import com.example.engine.assets.LoadedGameAssets
+import com.example.engine.assets.CombatAtlasAssets
 import com.example.engine.assets.SpriteSheetLoader
+import com.example.engine.assets.UiPreviewAssets
 import com.example.engine.sim.CombatHudSnapshot
 import com.example.engine.sim.CombatSimulation
 import com.example.engine.svdag.SvdagBuilder
 import com.example.engine.svdag.SvdagCompiledChunk
 import com.example.model.*
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import java.util.concurrent.ConcurrentHashMap
 
 enum class AppScreen {
     HERO_SELECT,
@@ -35,6 +40,7 @@ enum class ArenaModal {
 
 data class GameUiState(
     val isReady: Boolean = false,
+    val initError: String? = null,
     val screen: AppScreen = AppScreen.HERO_SELECT,
     val activeModal: ArenaModal = ArenaModal.NONE,
     val language: GameLanguage = GameLanguage.UA,
@@ -57,17 +63,28 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
 
     private val repo = GameRepository(AppDatabase.getInstance(app))
 
+    private data class InitStatus(
+        val ready: Boolean = false,
+        val error: String? = null
+    )
+
     private val _screen = MutableStateFlow(AppScreen.HERO_SELECT)
     private val _modal = MutableStateFlow(ArenaModal.NONE)
     private val _selectedZone = MutableStateFlow(ZoneId.FACTORY_ZONE)
     private val _hud = MutableStateFlow(CombatHudSnapshot())
     private val _recentLootKey = MutableStateFlow<String?>(null)
-    private val _ready = MutableStateFlow(false)
+    private val _initStatus = MutableStateFlow(InitStatus())
+    private var initJob: Job? = null
 
-    lateinit var loadedAssets: LoadedGameAssets
+    @Volatile
+    var uiPreviews: UiPreviewAssets? = null
         private set
 
-    val svdagChunks: MutableMap<ZoneId, SvdagCompiledChunk> = mutableMapOf()
+    @Volatile
+    var combatAtlas: CombatAtlasAssets? = null
+        private set
+
+    val svdagChunks: ConcurrentHashMap<ZoneId, SvdagCompiledChunk> = ConcurrentHashMap()
 
     @Volatile
     var onZoneChangedForGl: ((ZoneId) -> Unit)? = null
@@ -108,8 +125,9 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
     private val comboFlow = selectedClassFlow.flatMapLatest { repo.observeCombo(it) }
     private val talentFlow = selectedClassFlow.flatMapLatest { repo.observeTalents(it) }
 
+    // REPAIR_HOOK: Агрегація Room Flow + стану ініціалізації та синхронізація білду в CombatSimulation
     val uiState: StateFlow<GameUiState> = combine(
-        _ready,
+        _initStatus,
         _screen,
         _modal,
         settingsFlow,
@@ -121,7 +139,7 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         _selectedZone,
         _hud
     ) { arr ->
-        val ready = arr[0] as Boolean
+        val initStatus = arr[0] as InitStatus
         val screen = arr[1] as AppScreen
         val modal = arr[2] as ArenaModal
         val settings = arr[3] as AppSettingsEntity
@@ -147,11 +165,11 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         val stats = RpgCatalog.computeStats(hc, level, equipped, talents)
         val skills = RpgCatalog.skillsForClass(hc, talents)
 
-        // Keep live simulation stats synced whenever inventory/talents/combos mutate
         simulation.updateHeroBuild(stats, combo, skills)
 
         GameUiState(
-            isReady = ready,
+            isReady = initStatus.ready,
+            initError = initStatus.error,
             screen = screen,
             activeModal = modal,
             language = runCatching { GameLanguage.valueOf(settings.language) }.getOrDefault(GameLanguage.UA),
@@ -173,16 +191,48 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         )
     }.stateIn(viewModelScope, SharingStarted.Eagerly, GameUiState())
 
+    // REPAIR_HOOK: Асинхронний старт БД та графічних асетів з діагностикою збоїв і кнопкою повтору
     init {
-        viewModelScope.launch(Dispatchers.IO) {
-            repo.ensureSeeded()
-            loadedAssets = SpriteSheetLoader.loadAll(app)
-            LoadedGameAssetsHolder.assets = loadedAssets
-            ZoneId.entries.forEach { z ->
-                svdagChunks[z] = SvdagBuilder.buildForZone(z)
+        retryInitialization()
+    }
+
+    fun retryInitialization() {
+        if (initJob?.isActive == true) return
+        _initStatus.value = InitStatus(ready = false, error = null)
+        initJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                // Fast path: seed DB & load lightweight UI previews so initial Window sync completes well under 1s
+                repo.ensureSeeded()
+                val previews = SpriteSheetLoader.loadUiPreviews(getApplication())
+                uiPreviews = previews
+                LoadedGameAssetsHolder.previews = previews
+                _initStatus.value = InitStatus(ready = true, error = null)
+
+                // Yield briefly so SurfaceSyncGroup and first Compose layout settle cleanly, then pre-warm combat assets
+                delay(350)
+                ensureCombatAssetsLoaded(ZoneId.FACTORY_ZONE)
+            } catch (t: Throwable) {
+                Log.e("GameViewModel", "Помилка стартової ініціалізації", t)
+                val detail = t.localizedMessage?.takeIf { it.isNotBlank() } ?: t::class.java.simpleName
+                _initStatus.value = InitStatus(
+                    ready = false,
+                    error = "Не вдалося завантажити ресурси або ініціалізувати базу даних ($detail). Перевірте наявність спрайт-листів у app/src/main/assets/ та повторіть спробу."
+                )
             }
-            _ready.value = true
         }
+    }
+
+    private fun ensureCombatAssetsLoaded(priorityZone: ZoneId) {
+        if (combatAtlas == null) {
+            synchronized(this) {
+                if (combatAtlas == null) {
+                    val atlas = SpriteSheetLoader.loadCombatAtlas(getApplication())
+                    combatAtlas = atlas
+                    LoadedGameAssetsHolder.combatAtlas = atlas
+                }
+            }
+        }
+        svdagChunks.computeIfAbsent(priorityZone) { SvdagBuilder.buildForZone(it) }
     }
 
     fun pushGlHudSnapshot(fps: Int) {
@@ -224,18 +274,31 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         _selectedZone.value = zoneId
     }
 
+    // REPAIR_HOOK: Запуск зони, прогрів бойового атласу/SVDAG та переключення сцени
     fun deployToZone(zoneId: ZoneId) {
         _selectedZone.value = zoneId
         _modal.value = ArenaModal.NONE
         val st = uiState.value
         simulation.startZone(zoneId, st.selectedHeroClass, st.computedStats, st.comboSlots, st.activeSkills)
-        onZoneChangedForGl?.invoke(zoneId)
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                ensureCombatAssetsLoaded(zoneId)
+                onZoneChangedForGl?.invoke(zoneId)
+            } catch (t: Throwable) {
+                Log.e("GameViewModel", "Помилка підготовки бойових асетів зони $zoneId", t)
+                val detail = t.localizedMessage?.takeIf { it.isNotBlank() } ?: t::class.java.simpleName
+                _initStatus.value = InitStatus(
+                    ready = false,
+                    error = "Не вдалося підготувати бойовий атлас або SVDAG-чанк для зони $zoneId ($detail)."
+                )
+            }
+        }
         _screen.value = AppScreen.ARENA
     }
 
     fun openModal(modal: ArenaModal) {
         if (modal != ArenaModal.NONE && !simulation.isPaused && _screen.value == AppScreen.ARENA) {
-            simulation.isPaused = true
+            simulation.requestPause(true)
         }
         _modal.value = modal
     }
@@ -348,7 +411,10 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
 
 object LoadedGameAssetsHolder {
     @Volatile
-    var assets: LoadedGameAssets? = null
+    var previews: UiPreviewAssets? = null
+
+    @Volatile
+    var combatAtlas: CombatAtlasAssets? = null
 
     @Volatile
     var scene: com.example.engine.render.IronboundLittleKtScene? = null

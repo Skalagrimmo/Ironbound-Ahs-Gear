@@ -2,6 +2,7 @@ package com.example.engine.sim
 
 import com.example.engine.assets.AnimKind
 import com.example.model.*
+import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.math.*
 import kotlin.random.Random
 
@@ -95,8 +96,35 @@ class CombatSimulation(
     var comboSlots: List<ComboSlotModel> = emptyList()
     var activeSkills: List<SkillDef> = emptyList()
 
+    // REPAIR_HOOK: Потік симуляції (LittleKt GLThread) є єдиним власником стану арени; зовнішні потоки (Compose UI / ViewModel) передають команди через ConcurrentLinkedQueue
+    private sealed interface SimCommand {
+        data class StartZone(
+            val zone: ZoneId,
+            val hClass: HeroClass,
+            val stats: ComputedHeroStats,
+            val combos: List<ComboSlotModel>,
+            val skills: List<SkillDef>
+        ) : SimCommand
+        data class UpdateHeroBuild(
+            val stats: ComputedHeroStats,
+            val combos: List<ComboSlotModel>,
+            val skills: List<SkillDef>
+        ) : SimCommand
+        data class WorldTap(val worldX: Float, val worldY: Float) : SimCommand
+        data object BasicComboAttack : SimCommand
+        data class TriggerSkill(val skillIndex: Int) : SimCommand
+        data object TriggerPotion : SimCommand
+        data object TogglePause : SimCommand
+        data class SetPaused(val paused: Boolean) : SimCommand
+        data object ClearQueue : SimCommand
+    }
+
+    private val commandQueue = ConcurrentLinkedQueue<SimCommand>()
+
     // Hero live state in normalized 0..32 arena coordinates (play area 4..28)
+    @Volatile
     var heroX: Float = 16f
+    @Volatile
     var heroY: Float = 20f
     var heroHp: Int = 340
     var heroEnergy: Float = 100f
@@ -106,12 +134,16 @@ class CombatSimulation(
     var heroAttackLock: Float = 0f
     var heroHurtFlash: Float = 0f
 
+    @Volatile
     var joystickX: Float = 0f
+    @Volatile
     var joystickY: Float = 0f
     var moveTargetX: Float? = null
     var moveTargetY: Float? = null
 
+    @Volatile
     var isPaused: Boolean = false
+        private set
     var selectedTargetId: Int? = null
     val queuedOrders = ArrayList<QueuedOrder>()
 
@@ -131,7 +163,76 @@ class CombatSimulation(
     private var elapsedZoneSec = 0f
     private var zoneClearFired = false
 
+    fun setJoystick(dx: Float, dy: Float) {
+        joystickX = dx
+        joystickY = dy
+    }
+
+    // REPAIR_HOOK: Ініціалізація бойової зони, скидання таймерів та спавн ворогів через потокобезпечну чергу
     fun startZone(
+        zone: ZoneId,
+        hClass: HeroClass,
+        stats: ComputedHeroStats,
+        combos: List<ComboSlotModel>,
+        skills: List<SkillDef>
+    ) {
+        commandQueue.offer(SimCommand.StartZone(zone, hClass, stats, combos, skills))
+    }
+
+    fun updateHeroBuild(stats: ComputedHeroStats, combos: List<ComboSlotModel>, skills: List<SkillDef>) {
+        commandQueue.offer(SimCommand.UpdateHeroBuild(stats, combos, skills))
+    }
+
+    fun togglePause() {
+        commandQueue.offer(SimCommand.TogglePause)
+    }
+
+    fun requestPause(paused: Boolean) {
+        commandQueue.offer(SimCommand.SetPaused(paused))
+    }
+
+    fun clearQueue() {
+        commandQueue.offer(SimCommand.ClearQueue)
+    }
+
+    fun handleWorldTap(worldX: Float, worldY: Float) {
+        commandQueue.offer(SimCommand.WorldTap(worldX, worldY))
+    }
+
+    fun triggerBasicComboAttack() {
+        commandQueue.offer(SimCommand.BasicComboAttack)
+    }
+
+    fun triggerSkill(skillIndex: Int) {
+        commandQueue.offer(SimCommand.TriggerSkill(skillIndex))
+    }
+
+    fun triggerPotion() {
+        commandQueue.offer(SimCommand.TriggerPotion)
+    }
+
+    fun drainPendingCommands() {
+        while (true) {
+            val cmd = commandQueue.poll() ?: break
+            when (cmd) {
+                is SimCommand.StartZone -> applyStartZone(cmd.zone, cmd.hClass, cmd.stats, cmd.combos, cmd.skills)
+                is SimCommand.UpdateHeroBuild -> applyUpdateHeroBuild(cmd.stats, cmd.combos, cmd.skills)
+                is SimCommand.WorldTap -> applyWorldTap(cmd.worldX, cmd.worldY)
+                SimCommand.BasicComboAttack -> applyBasicComboAttack(null)
+                is SimCommand.TriggerSkill -> applyTriggerSkill(cmd.skillIndex)
+                SimCommand.TriggerPotion -> applyTriggerPotion()
+                SimCommand.TogglePause -> {
+                    isPaused = !isPaused
+                }
+                is SimCommand.SetPaused -> {
+                    isPaused = cmd.paused
+                }
+                SimCommand.ClearQueue -> queuedOrders.clear()
+            }
+        }
+    }
+
+    private fun applyStartZone(
         zone: ZoneId,
         hClass: HeroClass,
         stats: ComputedHeroStats,
@@ -172,7 +273,7 @@ class CombatSimulation(
         spawnZoneEnemies(zone)
     }
 
-    fun updateHeroBuild(stats: ComputedHeroStats, combos: List<ComboSlotModel>, skills: List<SkillDef>) {
+    private fun applyUpdateHeroBuild(stats: ComputedHeroStats, combos: List<ComboSlotModel>, skills: List<SkillDef>) {
         val ratio = if (heroStats.maxHp > 0) heroHp.toFloat() / heroStats.maxHp else 1f
         heroStats = stats
         heroHp = (stats.maxHp * ratio).toInt().coerceIn(1, stats.maxHp)
@@ -220,15 +321,8 @@ class CombatSimulation(
         }
     }
 
-    fun togglePause() {
-        isPaused = !isPaused
-    }
-
-    fun clearQueue() {
-        queuedOrders.clear()
-    }
-
-    fun handleWorldTap(worldX: Float, worldY: Float) {
+    // REPAIR_HOOK: Обробка натискань арени, базових комбо, вмінь і планування наказів RTWP (тільки на потоці симуляції)
+    private fun applyWorldTap(worldX: Float, worldY: Float) {
         val clampedX = worldX.coerceIn(4.5f, 27.5f)
         val clampedY = worldY.coerceIn(4.5f, 27.5f)
         val tappedEnemy = enemies.filter { !it.isDead }
@@ -245,7 +339,7 @@ class CombatSimulation(
         } else {
             if (tappedEnemy != null) {
                 selectedTargetId = tappedEnemy.id
-                triggerBasicComboAttack(tappedEnemy)
+                applyBasicComboAttack(tappedEnemy)
             } else {
                 moveTargetX = clampedX
                 moveTargetY = clampedY
@@ -253,7 +347,7 @@ class CombatSimulation(
         }
     }
 
-    fun triggerBasicComboAttack(explicitTarget: EnemyActor? = null) {
+    private fun applyBasicComboAttack(explicitTarget: EnemyActor?) {
         if (heroHp <= 0) return
         if (isPaused) {
             val target = explicitTarget ?: findNearestEnemy()
@@ -281,7 +375,7 @@ class CombatSimulation(
         executeComboStrikeOn(target)
     }
 
-    fun triggerSkill(skillIndex: Int) {
+    private fun applyTriggerSkill(skillIndex: Int) {
         val skill = activeSkills.getOrNull(skillIndex) ?: return
         if (skillCooldowns[skillIndex] > 0f || heroEnergy < skill.energyCost || heroHp <= 0) return
 
@@ -295,7 +389,7 @@ class CombatSimulation(
         executeSkillNow(skillIndex, heroX, heroY)
     }
 
-    fun triggerPotion() {
+    private fun applyTriggerPotion() {
         if (potionCooldown > 0f || heroHp <= 0) return
         if (isPaused) {
             queuedOrders.add(QueuedOrder.UsePotion)
@@ -455,7 +549,9 @@ class CombatSimulation(
         spawnFloatingText(enemy.x, enemy.y - 0.7f, text, color)
     }
 
+    // REPAIR_HOOK: Головний крок бойової симуляції (дренаж команд, пауза RTWP, рух, ШІ ворогів, проєктайли, умова зачистки зони)
     fun step(rawDt: Float) {
+        drainPendingCommands()
         val dt = rawDt.coerceIn(0f, 0.05f)
 
         // Update floating text & pulses subtly even slowly, or freeze simulation completely when paused
@@ -478,7 +574,7 @@ class CombatSimulation(
             if (comboResetTimer <= 0f) comboStep = 0
         }
 
-        // Execute queued Tactical Pause orders sequentially
+        // REPAIR_HOOK: Послідовне виконання черги наказів Тактичної Паузи (RTWP)
         if (queuedOrders.isNotEmpty() && heroAttackLock <= 0f) {
             val next = queuedOrders.first()
             when (next) {

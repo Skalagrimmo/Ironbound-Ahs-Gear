@@ -1,5 +1,6 @@
 package com.example.data.repo
 
+import androidx.room.withTransaction
 import com.example.data.db.*
 import com.example.model.*
 import kotlinx.coroutines.flow.Flow
@@ -74,127 +75,134 @@ class GameRepository(private val db: AppDatabase) {
 
     fun observeZones(): Flow<List<ZoneProgressEntity>> = zoneDao.observeZones()
 
+    // REPAIR_HOOK: Ідемпотентне транзакційне засівання БД (відновлює частково ініціалізований профіль/предмети/зони без перезапису прогресу)
     suspend fun ensureSeeded() {
-        if (heroDao.getHeroOnce(HeroClass.KNIGHT.id) != null) return
-
-        settingsDao.upsertSettings(
-            AppSettingsEntity(
-                id = 1,
-                language = GameLanguage.UA.code,
-                svdagPreset = SvdagQualityPreset.BALANCED.name,
-                showTelemetry = true,
-                hapticsEnabled = true,
-                selectedHeroClass = HeroClass.KNIGHT.id
-            )
-        )
-
-        HeroClass.entries.forEach { hc ->
-            heroDao.upsertHero(
-                HeroProfileEntity(
-                    heroClass = hc.id,
-                    level = 1,
-                    xp = 0,
-                    scrapCurrency = 60,
-                    talentPointsAvailable = 2,
-                    killsTotal = 0
+        db.withTransaction {
+            if (settingsDao.getSettingsOnce() == null) {
+                settingsDao.upsertSettings(
+                    AppSettingsEntity(
+                        id = 1,
+                        language = GameLanguage.UA.code,
+                        svdagPreset = SvdagQualityPreset.BALANCED.name,
+                        showTelemetry = true,
+                        hapticsEnabled = true,
+                        selectedHeroClass = HeroClass.KNIGHT.id
+                    )
                 )
-            )
-
-            // Seed starter gear
-            val weaponKey = when (hc) {
-                HeroClass.KNIGHT -> "starter_sword"
-                HeroClass.RIFLEMAN -> "starter_crossbow"
-                HeroClass.TECHNOMANCER -> "starter_staff"
             }
-            val offhandKey = when (hc) {
-                HeroClass.KNIGHT -> "starter_shield"
-                HeroClass.RIFLEMAN -> "starter_quiver"
-                HeroClass.TECHNOMANCER -> "starter_core"
-            }
-            invDao.insertItem(
-                InventoryItemEntity(
-                    heroClass = hc.id,
-                    titleKey = weaponKey,
-                    slot = EquipSlot.WEAPON.name,
-                    rarity = ItemRarity.BRASS.name,
-                    itemLevel = 1,
-                    bonusDamage = 10,
-                    bonusArmor = 0,
-                    bonusHp = 0,
-                    bonusCritPct = 4,
-                    bonusLifestealPct = 0,
-                    bonusCooldownHastePct = 0,
-                    isEquipped = true,
-                    salvageScrap = 12
-                )
-            )
-            invDao.insertItem(
-                InventoryItemEntity(
-                    heroClass = hc.id,
-                    titleKey = offhandKey,
-                    slot = EquipSlot.OFFHAND.name,
-                    rarity = ItemRarity.IRON.name,
-                    itemLevel = 1,
-                    bonusDamage = 3,
-                    bonusArmor = 6,
-                    bonusHp = 20,
-                    bonusCritPct = 0,
-                    bonusLifestealPct = 0,
-                    bonusCooldownHastePct = 0,
-                    isEquipped = true,
-                    salvageScrap = 8
-                )
-            )
-            invDao.insertItem(
-                InventoryItemEntity(
-                    heroClass = hc.id,
-                    titleKey = "starter_armor",
-                    slot = EquipSlot.ARMOR.name,
-                    rarity = ItemRarity.IRON.name,
-                    itemLevel = 1,
-                    bonusDamage = 0,
-                    bonusArmor = 10,
-                    bonusHp = 35,
-                    bonusCritPct = 0,
-                    bonusLifestealPct = 0,
-                    bonusCooldownHastePct = 0,
-                    isEquipped = true,
-                    salvageScrap = 10
-                )
-            )
 
-            // Seed Remember Me 6-slot combo (first 4 unlocked at Lv1, slots 5-6 unlock at Lv2/Lv4)
-            val defaults = listOf(
-                PressenType.POWER to PressenTier.MK1,
-                PressenType.CHAIN to PressenTier.MK1,
-                PressenType.REGEN to PressenTier.MK1,
-                PressenType.COOLDOWN to PressenTier.MK1,
-                PressenType.POWER to PressenTier.MK2,
-                PressenType.CHAIN to PressenTier.MK2
-            )
-            comboDao.upsertSlots(
-                defaults.mapIndexed { idx, (ptype, ptier) ->
-                    ComboSlotEntity(
-                        heroClass = hc.id,
-                        slotIndex = idx,
-                        pressenType = ptype.name,
-                        tier = ptier.name,
-                        unlocked = idx < 4
+            HeroClass.entries.forEach { hc ->
+                if (heroDao.getHeroOnce(hc.id) == null) {
+                    heroDao.upsertHero(
+                        HeroProfileEntity(
+                            heroClass = hc.id,
+                            level = 1,
+                            xp = 0,
+                            scrapCurrency = 60,
+                            talentPointsAvailable = 2,
+                            killsTotal = 0
+                        )
+                    )
+                }
+
+                if (invDao.countItemsForHero(hc.id) == 0) {
+                    val weaponKey = when (hc) {
+                        HeroClass.KNIGHT -> "starter_sword"
+                        HeroClass.RIFLEMAN -> "starter_crossbow"
+                        HeroClass.TECHNOMANCER -> "starter_staff"
+                    }
+                    val offhandKey = when (hc) {
+                        HeroClass.KNIGHT -> "starter_shield"
+                        HeroClass.RIFLEMAN -> "starter_quiver"
+                        HeroClass.TECHNOMANCER -> "starter_core"
+                    }
+                    invDao.insertItem(
+                        InventoryItemEntity(
+                            heroClass = hc.id,
+                            titleKey = weaponKey,
+                            slot = EquipSlot.WEAPON.name,
+                            rarity = ItemRarity.BRASS.name,
+                            itemLevel = 1,
+                            bonusDamage = 10,
+                            bonusArmor = 0,
+                            bonusHp = 0,
+                            bonusCritPct = 4,
+                            bonusLifestealPct = 0,
+                            bonusCooldownHastePct = 0,
+                            isEquipped = true,
+                            salvageScrap = 12
+                        )
+                    )
+                    invDao.insertItem(
+                        InventoryItemEntity(
+                            heroClass = hc.id,
+                            titleKey = offhandKey,
+                            slot = EquipSlot.OFFHAND.name,
+                            rarity = ItemRarity.IRON.name,
+                            itemLevel = 1,
+                            bonusDamage = 3,
+                            bonusArmor = 6,
+                            bonusHp = 20,
+                            bonusCritPct = 0,
+                            bonusLifestealPct = 0,
+                            bonusCooldownHastePct = 0,
+                            isEquipped = true,
+                            salvageScrap = 8
+                        )
+                    )
+                    invDao.insertItem(
+                        InventoryItemEntity(
+                            heroClass = hc.id,
+                            titleKey = "starter_armor",
+                            slot = EquipSlot.ARMOR.name,
+                            rarity = ItemRarity.IRON.name,
+                            itemLevel = 1,
+                            bonusDamage = 0,
+                            bonusArmor = 10,
+                            bonusHp = 35,
+                            bonusCritPct = 0,
+                            bonusLifestealPct = 0,
+                            bonusCooldownHastePct = 0,
+                            isEquipped = true,
+                            salvageScrap = 10
+                        )
+                    )
+                }
+
+                if (comboDao.countSlotsForHero(hc.id) == 0) {
+                    val defaults = listOf(
+                        PressenType.POWER to PressenTier.MK1,
+                        PressenType.CHAIN to PressenTier.MK1,
+                        PressenType.REGEN to PressenTier.MK1,
+                        PressenType.COOLDOWN to PressenTier.MK1,
+                        PressenType.POWER to PressenTier.MK2,
+                        PressenType.CHAIN to PressenTier.MK2
+                    )
+                    comboDao.upsertSlots(
+                        defaults.mapIndexed { idx, (ptype, ptier) ->
+                            ComboSlotEntity(
+                                heroClass = hc.id,
+                                slotIndex = idx,
+                                pressenType = ptype.name,
+                                tier = ptier.name,
+                                unlocked = idx < 4
+                            )
+                        }
+                    )
+                }
+            }
+
+            // Seed/repair all 5 zones from the Overworld Map without overwriting clearedCount
+            zoneDao.insertZonesIgnore(
+                ZoneId.entries.map { z ->
+                    ZoneProgressEntity(
+                        zoneId = z.name,
+                        unlocked = true,
+                        clearedCount = 0
                     )
                 }
             )
         }
-
-        // Seed 5 zones from the Overworld Map
-        zoneDao.insertZonesIgnore(
-            ZoneId.entries.map { z ->
-                ZoneProgressEntity(
-                    zoneId = z.name,
-                    unlocked = true, // All 5 world zones inspectable & playable from the start per user scope
-                    clearedCount = 0
-                )
-            }
-        )
     }
 
     suspend fun saveSettings(settings: AppSettingsEntity) {
@@ -213,37 +221,42 @@ class GameRepository(private val db: AppDatabase) {
         )
     }
 
+    // REPAIR_HOOK: Атомарна заміна екіпірованого предмета у слоті та переробка на брухт
     suspend fun equipItem(item: LootItemModel) {
-        val prev = invDao.getEquippedInSlot(item.heroClass.id, item.slot.name)
-        val updated = prev.map { it.copy(isEquipped = false) }
-        if (updated.isNotEmpty()) {
-            invDao.updateItems(updated)
-        }
-        invDao.insertItem(
-            InventoryItemEntity(
-                id = item.id,
-                heroClass = item.heroClass.id,
-                titleKey = item.titleKey,
-                slot = item.slot.name,
-                rarity = item.rarity.name,
-                itemLevel = item.itemLevel,
-                bonusDamage = item.affixes.bonusDamage,
-                bonusArmor = item.affixes.bonusArmor,
-                bonusHp = item.affixes.bonusHp,
-                bonusCritPct = item.affixes.bonusCritPct,
-                bonusLifestealPct = item.affixes.bonusLifestealPct,
-                bonusCooldownHastePct = item.affixes.bonusCooldownHastePct,
-                isEquipped = true,
-                salvageScrap = item.salvageScrap
+        db.withTransaction {
+            val prev = invDao.getEquippedInSlot(item.heroClass.id, item.slot.name)
+            val updated = prev.map { it.copy(isEquipped = false) }
+            if (updated.isNotEmpty()) {
+                invDao.updateItems(updated)
+            }
+            invDao.insertItem(
+                InventoryItemEntity(
+                    id = item.id,
+                    heroClass = item.heroClass.id,
+                    titleKey = item.titleKey,
+                    slot = item.slot.name,
+                    rarity = item.rarity.name,
+                    itemLevel = item.itemLevel,
+                    bonusDamage = item.affixes.bonusDamage,
+                    bonusArmor = item.affixes.bonusArmor,
+                    bonusHp = item.affixes.bonusHp,
+                    bonusCritPct = item.affixes.bonusCritPct,
+                    bonusLifestealPct = item.affixes.bonusLifestealPct,
+                    bonusCooldownHastePct = item.affixes.bonusCooldownHastePct,
+                    isEquipped = true,
+                    salvageScrap = item.salvageScrap
+                )
             )
-        )
+        }
     }
 
     suspend fun salvageItem(item: LootItemModel) {
         if (item.isEquipped) return
-        invDao.deleteItemById(item.id)
-        val hero = heroDao.getHeroOnce(item.heroClass.id) ?: return
-        heroDao.upsertHero(hero.copy(scrapCurrency = hero.scrapCurrency + item.salvageScrap))
+        db.withTransaction {
+            invDao.deleteItemById(item.id)
+            val hero = heroDao.getHeroOnce(item.heroClass.id) ?: return@withTransaction
+            heroDao.upsertHero(hero.copy(scrapCurrency = hero.scrapCurrency + item.salvageScrap))
+        }
     }
 
     suspend fun forgeRandomGear(heroClass: HeroClass): LootItemModel? {

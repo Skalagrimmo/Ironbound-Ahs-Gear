@@ -182,6 +182,7 @@ object SvdagBuilder {
         }
 
         fun buildNode(ox: Int, oy: Int, oz: Int, halfSize: Int): Int {
+            if (oy >= 16) return 0
             if (halfSize == 1) {
                 // 2x2x2 leaf block
                 var mask = 0

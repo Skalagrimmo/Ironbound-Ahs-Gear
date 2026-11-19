@@ -10,7 +10,6 @@ import androidx.compose.ui.graphics.asImageBitmap
 import com.example.model.EnemyArchetype
 import com.example.model.HeroClass
 import com.example.model.ZoneId
-import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
@@ -30,23 +29,27 @@ data class AtlasUv(
     val aspect: Float
 )
 
-class LoadedGameAssets(
-    val atlasBitmap: Bitmap,
+class UiPreviewAssets(
     val heroPortraits: Map<HeroClass, ImageBitmap>,
     val worldMapBitmap: ImageBitmap,
-    val zoneThumbnails: Map<ZoneId, ImageBitmap>,
+    val zoneThumbnails: Map<ZoneId, ImageBitmap>
+)
+
+class CombatAtlasAssets(
+    val atlasBitmap: Bitmap,
     private val heroFrames: Map<Pair<HeroClass, AnimKind>, List<AtlasUv>>,
     private val enemyFrames: Map<Pair<EnemyArchetype, AnimKind>, List<AtlasUv>>
 ) {
+    // REPAIR_HOOK: Безпечний вибір кадру анімації (запобігає IndexOutOfBounds при від'ємному animTime)
     fun getHeroUv(hc: HeroClass, anim: AnimKind, animTime: Float): AtlasUv {
         val list = heroFrames[hc to anim] ?: heroFrames[hc to AnimKind.IDLE]!!
-        val idx = ((animTime * 4.5f).toInt()) % list.size
+        val idx = ((animTime * 4.5f).toInt().coerceAtLeast(0)) % list.size
         return list[idx]
     }
 
     fun getEnemyUv(archetype: EnemyArchetype, anim: AnimKind, animTime: Float): AtlasUv {
         val list = enemyFrames[archetype to anim] ?: enemyFrames[archetype to AnimKind.IDLE]!!
-        val idx = ((animTime * 4.2f).toInt()) % list.size
+        val idx = ((animTime * 4.2f).toInt().coerceAtLeast(0)) % list.size
         return list[idx]
     }
 }
@@ -58,13 +61,21 @@ object SpriteSheetLoader {
     private val sixColsLeftB = listOf(194 to 275, 279 to 357, 361 to 439, 443 to 521, 525 to 604, 608 to 688)
     private val sixColsRight = listOf(724 to 856, 864 to 958, 964 to 1068, 1074 to 1186, 1194 to 1284, 1292 to 1386)
 
-    fun loadAll(context: Context): LoadedGameAssets {
+    /**
+     * Lightweight startup loader: decodes only UI portraits, overworld map, and zone thumbnails
+     * using RGB_565 so first Compose & SurfaceView frames render immediately without GC pressure.
+     */
+    // REPAIR_HOOK: Точка завантаження та нарізки вихідних листів assets/sprites_characters.jpg і assets/world_biomes.jpg (1408x768)
+    fun loadUiPreviews(context: Context): UiPreviewAssets {
+        val opts = BitmapFactory.Options().apply {
+            inPreferredConfig = Bitmap.Config.RGB_565
+        }
         val spriteSheet = context.assets.open("sprites_characters.jpg").use {
-            BitmapFactory.decodeStream(it)
-        }
+            BitmapFactory.decodeStream(it, null, opts)
+        } ?: error("Не вдалося декодувати assets/sprites_characters.jpg")
         val biomeSheet = context.assets.open("world_biomes.jpg").use {
-            BitmapFactory.decodeStream(it)
-        }
+            BitmapFactory.decodeStream(it, null, opts)
+        } ?: error("Не вдалося декодувати assets/world_biomes.jpg")
 
         val portraits = mapOf(
             HeroClass.KNIGHT to cropCompose(spriteSheet, 14, 44, 182, 244),
@@ -72,7 +83,6 @@ object SpriteSheetLoader {
             HeroClass.TECHNOMANCER to cropCompose(spriteSheet, 14, 534, 182, 738)
         )
 
-        // Exact panels from 1408x768 world_biomes.jpg
         val worldMap = cropCompose(biomeSheet, 16, 528, 326, 750)
         val zoneThumbs = mapOf(
             ZoneId.FACTORY_ZONE to cropCompose(biomeSheet, 12, 12, 698, 488),
@@ -82,11 +92,34 @@ object SpriteSheetLoader {
             ZoneId.DARK_CONFLUENCE to cropCompose(biomeSheet, 712, 262, 1394, 754)
         )
 
-        // Build clean 1024x1024 transparent sprite atlas by edge-floodfill removing grid background
+        spriteSheet.recycle()
+        biomeSheet.recycle()
+
+        return UiPreviewAssets(
+            heroPortraits = portraits,
+            worldMapBitmap = worldMap,
+            zoneThumbnails = zoneThumbs
+        )
+    }
+
+    /**
+     * Builds the 1024x1024 ARGB_8888 sprite atlas off the critical launch path.
+     */
+    fun loadCombatAtlas(context: Context): CombatAtlasAssets {
+        val spriteSheet = context.assets.open("sprites_characters.jpg").use {
+            BitmapFactory.decodeStream(it)
+        } ?: error("Не вдалося декодувати assets/sprites_characters.jpg для бойового атласу")
+
         val atlasSize = 1024
         val cellSize = 128
         val atlas = Bitmap.createBitmap(atlasSize, atlasSize, Bitmap.Config.ARGB_8888)
         val canvas = android.graphics.Canvas(atlas)
+
+        // Reuse scratch buffers across all 46 sprite extractions to minimize GC pressure
+        val maxBuf = 140 * 150
+        val scratchPixels = IntArray(maxBuf)
+        val scratchVisited = BooleanArray(maxBuf)
+        val scratchQueue = IntArray(maxBuf)
 
         var cellIdx = 0
         val heroFrames = mutableMapOf<Pair<HeroClass, AnimKind>, MutableList<AtlasUv>>()
@@ -98,8 +131,9 @@ object SpriteSheetLoader {
             cellIdx++
             val dstX = col * cellSize
             val dstY = row * cellSize
-            val extracted = extractTransparentSprite(spriteSheet, srcRect)
-            // Scale cleanly preserving aspect inside 120x120 padded inside 128x128 cell
+            val extracted = extractTransparentSprite(
+                spriteSheet, srcRect, scratchPixels, scratchVisited, scratchQueue
+            )
             val maxDim = max(extracted.width, extracted.height).coerceAtLeast(1)
             val scale = 118f / maxDim
             val dw = (extracted.width * scale).toInt().coerceAtLeast(1)
@@ -177,12 +211,9 @@ object SpriteSheetLoader {
             addCell(Rect(sixColsLeftB[5].first, 660, sixColsLeftB[5].second, 742))
         )
 
-        // Enemies (Right side):
-        // Construct y=70..208
+        // Enemies (Right side)
         mapEnemyRow(enemyFrames, EnemyArchetype.CONSTRUCT, 70, 208, ::addCell)
-        // Scrapper y=304..408
         mapEnemyRow(enemyFrames, EnemyArchetype.SCRAPPER, 304, 408, ::addCell)
-        // Cultist y=486..600
         mapEnemyRow(enemyFrames, EnemyArchetype.CULTIST, 486, 600, ::addCell)
 
         // Rat Swarm y=654..740 (4 cols)
@@ -194,22 +225,16 @@ object SpriteSheetLoader {
         enemyFrames[EnemyArchetype.RAT_SWARM to AnimKind.WALK] = mutableListOf(rScurry, rIdle1)
         enemyFrames[EnemyArchetype.RAT_SWARM to AnimKind.ATTACK] = mutableListOf(rAtk)
         enemyFrames[EnemyArchetype.RAT_SWARM to AnimKind.HURT] = mutableListOf(rIdle0)
-        enemyFrames[EnemyClassFallback(EnemyArchetype.RAT_SWARM) to AnimKind.DEATH] = mutableListOf(rIdle1)
+        enemyFrames[EnemyArchetype.RAT_SWARM to AnimKind.DEATH] = mutableListOf(rIdle1)
 
         spriteSheet.recycle()
-        biomeSheet.recycle()
 
-        return LoadedGameAssets(
+        return CombatAtlasAssets(
             atlasBitmap = atlas,
-            heroPortraits = portraits,
-            worldMapBitmap = worldMap,
-            zoneThumbnails = zoneThumbs,
             heroFrames = heroFrames,
             enemyFrames = enemyFrames
         )
     }
-
-    private fun EnemyClassFallback(e: EnemyArchetype) = e
 
     private fun mapEnemyRow(
         map: MutableMap<Pair<EnemyArchetype, AnimKind>, MutableList<AtlasUv>>,
@@ -240,18 +265,25 @@ object SpriteSheetLoader {
         return Bitmap.createBitmap(src, cx, cy, cw, ch).asImageBitmap()
     }
 
-    /**
-     * Flood-fills from cell borders to key out the cool dark-slate grid background (#28333E)
-     * while preserving internal dark armor outlines and glowing spell particles.
-     */
-    private fun extractTransparentSprite(sheet: Bitmap, r: Rect): Bitmap {
+    private fun extractTransparentSprite(
+        sheet: Bitmap,
+        r: Rect,
+        scratchPixels: IntArray,
+        scratchVisited: BooleanArray,
+        scratchQueue: IntArray
+    ): Bitmap {
         val w = r.width().coerceAtLeast(1)
         val h = r.height().coerceAtLeast(1)
-        val pixels = IntArray(w * h)
+        val count = w * h
+        val pixels = if (count <= scratchPixels.size) scratchPixels else IntArray(count)
+        val visited = if (count <= scratchVisited.size) {
+            scratchVisited.fill(false, 0, count)
+            scratchVisited
+        } else BooleanArray(count)
+        val queue = if (count <= scratchQueue.size) scratchQueue else IntArray(count)
+
         sheet.getPixels(pixels, 0, w, r.left, r.top, w, h)
 
-        val visited = BooleanArray(w * h)
-        val queue = IntArray(w * h)
         var head = 0
         var tail = 0
 
@@ -261,7 +293,6 @@ object SpriteSheetLoader {
             val bb = Color.blue(c)
             val mx = max(rr, max(gg, bb))
             val mn = min(rr, min(gg, bb))
-            // Grid cell background is dark low-chroma blue-slate (~20..76 brightness)
             return mx < 86 && (mx - mn) < 26 && (bb >= rr - 4)
         }
 
@@ -293,7 +324,6 @@ object SpriteSheetLoader {
             if (cy < h - 1) enqueueIfBg(cx, cy + 1)
         }
 
-        // Soften 1px fringe around cleared background
         for (y in 1 until h - 1) {
             for (x in 1 until w - 1) {
                 val i = y * w + x

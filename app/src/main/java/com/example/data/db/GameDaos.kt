@@ -26,6 +26,9 @@ interface InventoryDao {
     @Query("SELECT * FROM inventory_items WHERE heroClass = :heroClass AND slot = :slot AND isEquipped = 1")
     suspend fun getEquippedInSlot(heroClass: String, slot: String): List<InventoryItemEntity>
 
+    @Query("SELECT COUNT(*) FROM inventory_items WHERE heroClass = :heroClass")
+    suspend fun countItemsForHero(heroClass: String): Int
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertItem(item: InventoryItemEntity): Long
 
@@ -40,6 +43,9 @@ interface InventoryDao {
 interface ComboDao {
     @Query("SELECT * FROM combo_slots WHERE heroClass = :heroClass ORDER BY slotIndex ASC")
     fun observeCombo(heroClass: String): Flow<List<ComboSlotEntity>>
+
+    @Query("SELECT COUNT(*) FROM combo_slots WHERE heroClass = :heroClass")
+    suspend fun countSlotsForHero(heroClass: String): Int
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertSlot(slot: ComboSlotEntity)
@@ -79,6 +85,9 @@ interface ZoneDao {
 interface SettingsDao {
     @Query("SELECT * FROM app_settings WHERE id = 1")
     fun observeSettings(): Flow<AppSettingsEntity?>
+
+    @Query("SELECT * FROM app_settings WHERE id = 1")
+    suspend fun getSettingsOnce(): AppSettingsEntity?
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertSettings(settings: AppSettingsEntity)

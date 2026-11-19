@@ -1,22 +1,38 @@
 package com.example
 
+import android.opengl.GLSurfaceView
 import android.os.Bundle
+import android.view.View
 import android.view.ViewGroup
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.ViewCompositionStrategy
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.engine.render.IronboundLittleKtScene
@@ -25,8 +41,13 @@ import com.example.ui.screens.ArenaHudOverlay
 import com.example.ui.screens.HeroSelectScreen
 import com.example.ui.screens.WorldMapScreen
 import com.example.ui.theme.BurnishedGold
+import com.example.ui.theme.CastIronSurface
+import com.example.ui.theme.CrimsonStrike
 import com.example.ui.theme.IronboundTheme
+import com.example.ui.theme.OnBrassDark
+import com.example.ui.theme.ParchmentText
 import com.example.ui.theme.SootCharcoal
+import com.example.ui.theme.TarnishedBrass
 import com.example.viewmodel.AppScreen
 import com.example.viewmodel.ArenaModal
 import com.example.viewmodel.GameViewModel
@@ -39,12 +60,14 @@ class MainActivity : ComponentActivity() {
 
     private val viewModel: GameViewModel by viewModels()
     private var littleKtApp: LittleKtApp? = null
+    private var glSurfaceView: GLSurfaceView? = null
 
+    // REPAIR_HOOK: Хост LittleKt OpenGL ES + накладений ComposeView і керування GLSurfaceView.renderMode
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        // Host LittleKt OpenGL ES surface underneath transparent Jetpack Compose HUD
+        // Host LittleKt OpenGL ES surface underneath Jetpack Compose UI
         littleKtApp = createLittleKtApp {
             activity = this@MainActivity
             title = "Ironbound RPG"
@@ -55,11 +78,30 @@ class MainActivity : ComponentActivity() {
             IronboundLittleKtScene(ctx, viewModel)
         }
 
+        // Locate LittleKt's GLSurfaceView so we can throttle renderMode off-arena
+        // and keep menu screens free of continuous SurfaceView buffer churn
+        glSurfaceView = findGlSurfaceView(window.decorView)
+        glSurfaceView?.setPreserveEGLContextOnPause(true)
+        glSurfaceView?.renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
+
         val composeOverlay = ComposeView(this).apply {
             setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
             setContent {
                 IronboundTheme {
-                    IronboundRootContent(viewModel)
+                    IronboundRootContent(
+                        viewModel = viewModel,
+                        onScreenChanged = { screen ->
+                            glSurfaceView?.let { glv ->
+                                if (screen == AppScreen.ARENA) {
+                                    glv.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
+                                    glv.requestRender()
+                                } else {
+                                    glv.renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
+                                    glv.requestRender()
+                                }
+                            }
+                        }
+                    )
                 }
             }
         }
@@ -72,9 +114,28 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    private fun findGlSurfaceView(root: View): GLSurfaceView? {
+        if (root is GLSurfaceView) return root
+        if (root is ViewGroup) {
+            for (i in 0 until root.childCount) {
+                findGlSurfaceView(root.getChildAt(i))?.let { return it }
+            }
+        }
+        return null
+    }
+
+    // REPAIR_HOOK: Життєвий цикл Android -> синхронізація pause/resume/destroy контексту LittleKt
     override fun onResume() {
         super.onResume()
         (littleKtApp?.context as? AndroidContext)?.resume()
+        glSurfaceView?.let { glv ->
+            if (viewModel.uiState.value.screen == AppScreen.ARENA) {
+                glv.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
+            } else {
+                glv.renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
+                glv.requestRender()
+            }
+        }
     }
 
     override fun onPause() {
@@ -89,8 +150,80 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun IronboundRootContent(viewModel: GameViewModel) {
+private fun IronboundRootContent(
+    viewModel: GameViewModel,
+    onScreenChanged: (AppScreen) -> Unit
+) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
+
+    LaunchedEffect(state.screen) {
+        onScreenChanged(state.screen)
+    }
+
+    // REPAIR_HOOK: Стартова перевірка помилок ініціалізації (запобігає нескінченному спінеру завантаження)
+    val initError = state.initError
+    if (initError != null) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(SootCharcoal)
+                .windowInsetsPadding(WindowInsets.safeDrawing)
+                .padding(20.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Card(
+                modifier = Modifier
+                    .widthIn(max = 460.dp)
+                    .testTag("init_error_card"),
+                shape = RoundedCornerShape(18.dp),
+                colors = CardDefaults.cardColors(containerColor = CastIronSurface),
+                border = BorderStroke(1.5.dp, CrimsonStrike)
+            ) {
+                Column(
+                    modifier = Modifier.padding(22.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Warning,
+                        contentDescription = "Помилка ініціалізації",
+                        tint = CrimsonStrike,
+                        modifier = Modifier.size(42.dp)
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        text = "Помилка запуску Ironbound",
+                        style = MaterialTheme.typography.titleLarge,
+                        color = BurnishedGold,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = initError,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = ParchmentText,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    Button(
+                        onClick = { viewModel.retryInitialization() },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("retry_init_button"),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = TarnishedBrass,
+                            contentColor = OnBrassDark
+                        )
+                    ) {
+                        Icon(Icons.Default.Refresh, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Повторити спробу", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+        return
+    }
 
     if (!state.isReady) {
         Box(

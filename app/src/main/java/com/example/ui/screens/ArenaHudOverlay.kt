@@ -54,7 +54,7 @@ fun ArenaHudOverlay(
             .fillMaxSize()
             .onSizeChanged { viewportSize = it }
     ) {
-        // Full-screen isometric tap target layer -> converts screen taps to SVDAG arena coordinates
+        // REPAIR_HOOK: Перетворення дотиків та віртуального джойстика Compose HUD у команди CombatSimulation
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -131,7 +131,7 @@ fun ArenaHudOverlay(
                         .padding(8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    val portrait = LoadedGameAssetsHolder.assets?.heroPortraits?.get(state.selectedHeroClass)
+                    val portrait = LoadedGameAssetsHolder.previews?.heroPortraits?.get(state.selectedHeroClass)
                     Box(
                         modifier = Modifier
                             .size(46.dp)
@@ -308,8 +308,7 @@ fun ArenaHudOverlay(
                     .align(Alignment.BottomStart)
                     .padding(start = 6.dp, bottom = 6.dp),
                 onMove = { dx, dy ->
-                    sim.joystickX = dx
-                    sim.joystickY = dy
+                    sim.setJoystick(dx, dy)
                 }
             )
 

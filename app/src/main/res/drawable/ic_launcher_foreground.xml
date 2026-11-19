@@ -3,6 +3,6 @@
     <item
         android:width="66dp"
         android:height="66dp"
-        android:drawable="@drawable/app_icon_foreground_1794838620307"
+        android:drawable="@drawable/ironbound_icon_1795083913082"
         android:gravity="center" />
 </layer-list>

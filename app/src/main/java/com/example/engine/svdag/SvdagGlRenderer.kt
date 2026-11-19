@@ -1,6 +1,7 @@
 package com.example.engine.svdag
 
 import android.opengl.GLES20
+import android.util.Log
 import com.example.model.SvdagQualityPreset
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -12,6 +13,10 @@ import java.nio.FloatBuffer
  * to render detailed 3D voxelized gothic-industrial architecture with minimal memory bandwidth.
  */
 class SvdagGlRenderer {
+
+    @Volatile
+    var lastGlError: String? = null
+        private set
 
     private var svdagProgram = 0
     private var blitProgram = 0
@@ -88,6 +93,7 @@ class SvdagGlRenderer {
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
     }
 
+    // REPAIR_HOOK: Точка рендерингу SVDAG у масштабований FBO (Exynos 7870 / Mali-T830) із перевіркою стану шейдерів та FBO
     fun renderBackdrop(
         viewportW: Int,
         viewportH: Int,
@@ -101,9 +107,25 @@ class SvdagGlRenderer {
         val chunk = currentChunk ?: return
         currentPreset = preset
 
+        if (svdagProgram == 0 || blitProgram == 0) {
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+            GLES20.glViewport(0, 0, viewportW, viewportH)
+            GLES20.glClearColor(0.05f, 0.06f, 0.08f, 1f)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+            return
+        }
+
         val targetW = (viewportW * preset.scale).toInt().coerceIn(240, 1920)
         val targetH = (viewportH * preset.scale).toInt().coerceIn(160, 1920)
         ensureFbo(targetW, targetH)
+        if (fboId == 0) {
+            // Безпечний фолбек при неповному FBO: рендер безпосередньо у головний буфер
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+            GLES20.glViewport(0, 0, viewportW, viewportH)
+            GLES20.glClearColor(0.05f, 0.06f, 0.08f, 1f)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+            return
+        }
 
         // Pass 1: Render SVDAG voxel environment into Mali-T830 scaled FBO
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboId)
@@ -179,7 +201,21 @@ class SvdagGlRenderer {
 
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboId)
         GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, fboColorTexId, 0)
-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        val fbStatus = GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER)
+        if (fbStatus != GLES20.GL_FRAMEBUFFER_COMPLETE) {
+            val msg = "Неповний FBO для SVDAG (${w}x${h}): status=0x${Integer.toHexString(fbStatus)}"
+            lastGlError = msg
+            Log.e(TAG, msg)
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+            GLES20.glDeleteFramebuffers(1, intArrayOf(fboId), 0)
+            GLES20.glDeleteTextures(1, intArrayOf(fboColorTexId), 0)
+            fboId = 0
+            fboColorTexId = 0
+            fboWidth = 0
+            fboHeight = 0
+        } else {
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        }
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
     }
 
@@ -203,15 +239,31 @@ class SvdagGlRenderer {
         initialized = false
     }
 
+    // REPAIR_HOOK: Діагностика компіляції та лінкування GLSL-шейдерів OpenGL ES
     private fun createProgram(vsSrc: String, fsSrc: String): Int {
         val vs = compileShader(GLES20.GL_VERTEX_SHADER, vsSrc)
         val fs = compileShader(GLES20.GL_FRAGMENT_SHADER, fsSrc)
+        if (vs == 0 || fs == 0) {
+            if (vs != 0) GLES20.glDeleteShader(vs)
+            if (fs != 0) GLES20.glDeleteShader(fs)
+            return 0
+        }
         val prog = GLES20.glCreateProgram()
         GLES20.glAttachShader(prog, vs)
         GLES20.glAttachShader(prog, fs)
         GLES20.glLinkProgram(prog)
+        val linked = IntArray(1)
+        GLES20.glGetProgramiv(prog, GLES20.GL_LINK_STATUS, linked, 0)
         GLES20.glDeleteShader(vs)
         GLES20.glDeleteShader(fs)
+        if (linked[0] == 0) {
+            val info = GLES20.glGetProgramInfoLog(prog)
+            val msg = "Помилка лінкування OpenGL програми: $info"
+            lastGlError = msg
+            Log.e(TAG, msg)
+            GLES20.glDeleteProgram(prog)
+            return 0
+        }
         return prog
     }
 
@@ -219,10 +271,22 @@ class SvdagGlRenderer {
         val s = GLES20.glCreateShader(type)
         GLES20.glShaderSource(s, src)
         GLES20.glCompileShader(s)
+        val compiled = IntArray(1)
+        GLES20.glGetShaderiv(s, GLES20.GL_COMPILE_STATUS, compiled, 0)
+        if (compiled[0] == 0) {
+            val info = GLES20.glGetShaderInfoLog(s)
+            val kind = if (type == GLES20.GL_VERTEX_SHADER) "vertex" else "fragment"
+            val msg = "Помилка компіляції $kind шейдера: $info"
+            lastGlError = msg
+            Log.e(TAG, msg)
+            GLES20.glDeleteShader(s)
+            return 0
+        }
         return s
     }
 
     companion object {
+        private const val TAG = "SvdagGlRenderer"
         private const val VERTEX_SHADER = """
             attribute vec2 aPos;
             attribute vec2 aUv;

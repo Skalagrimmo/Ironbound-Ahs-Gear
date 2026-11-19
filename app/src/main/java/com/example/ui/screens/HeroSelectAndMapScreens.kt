@@ -38,7 +38,7 @@ fun HeroSelectScreen(
     onOpenSettings: () -> Unit
 ) {
     val lang = state.language
-    val assets = LoadedGameAssetsHolder.assets
+    val assets = LoadedGameAssetsHolder.previews
 
     Box(
         modifier = Modifier
@@ -258,7 +258,7 @@ fun WorldMapScreen(
     onOpenSettings: () -> Unit
 ) {
     val lang = state.language
-    val assets = LoadedGameAssetsHolder.assets
+    val assets = LoadedGameAssetsHolder.previews
     val selectedZone = state.selectedZone
     val zp = state.zoneProgress[selectedZone]
 
